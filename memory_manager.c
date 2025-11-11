@@ -7,13 +7,14 @@
 typedef struct Block {
     size_t size;  // Total block size
     int free;
-} Block;  // Footer only
+    struct Block* next;  // Only for free blocks
+} Block;
 
 #define BLOCK_SIZE sizeof(Block)
 
 static void* memory_pool = NULL;
 static size_t pool_size = 0;
-static Block* free_list = NULL;  // Linked list of free blocks (pointers to their starts)
+static Block* free_list = NULL;
 static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /**
@@ -32,15 +33,14 @@ void mem_init(size_t size) {
         pthread_mutex_unlock(&mem_lock);
         exit(EXIT_FAILURE);
     }
-    // First free block: starts at memory_pool, size = pool_size - BLOCK_SIZE, footer at end
+    // First free block: starts at memory_pool, footer at end
     free_list = (Block*)memory_pool;
     free_list->size = pool_size - BLOCK_SIZE;
     free_list->free = 1;
+    free_list->next = NULL;
     Block* footer = (Block*)((char*)memory_pool + pool_size - BLOCK_SIZE);
     footer->size = pool_size - BLOCK_SIZE;
     footer->free = 1;
-    free_list = (Block*)memory_pool;  // free_list points to start of free block
-    ((Block*)memory_pool)->next = NULL;  // Add next pointer to Block for free list
     pthread_mutex_unlock(&mem_lock);
 }
 
@@ -67,10 +67,10 @@ void* mem_alloc(size_t size) {
                 Block* new_free = (Block*)((char*)curr + size + BLOCK_SIZE);
                 new_free->size = remaining;
                 new_free->free = 1;
+                new_free->next = curr->next;
                 Block* new_footer = (Block*)((char*)new_free + remaining);
                 new_footer->size = remaining;
                 new_footer->free = 1;
-                new_free->next = curr->next;
                 if (prev) prev->next = new_free;
                 else free_list = new_free;
             } else {
@@ -120,7 +120,7 @@ void mem_free(void* ptr) {
             else free_list = temp->next;
         }
     }
-    // Merge with prev (simplified, iterate free list)
+    // Merge with prev (iterate free list)
     Block* curr = free_list;
     while (curr) {
         if ((char*)curr + curr->size == (char*)ptr && curr->free) {
