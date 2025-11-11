@@ -36,7 +36,7 @@ void mem_init(size_t size) {
         exit(EXIT_FAILURE);
     }
 
-    // create a single large free block
+    // Create one large free block in the pool
     free_list = (Block *)memory_pool;
     free_list->size = pool_size - BLOCK_SIZE;
     free_list->free = 1;
@@ -46,28 +46,33 @@ void mem_init(size_t size) {
 }
 
 /**
- * Allocates a block of memory from within the pool.
- * First-fit strategy.
+ * Allocates a block of memory from the pool.
+ * First-fit strategy with 8-byte alignment.
  */
 void *mem_alloc(size_t size) {
     pthread_mutex_lock(&mem_lock);
 
+    // Align to 8 bytes
+    size = (size + 7) & ~7UL;
+
     Block *current = free_list;
     while (current != NULL) {
         if (current->free && current->size >= size) {
-            // split block if possible
-            if (current->size >= size + BLOCK_SIZE + 8) {
-                Block *new_block = (Block *)((char *)(current + 1) + size);
-                new_block->size = current->size - size - BLOCK_SIZE;
+            size_t remaining = current->size - size;
+
+            // Split block if there’s enough space left
+            if (remaining >= BLOCK_SIZE + 8) {
+                Block *new_block = (Block *)((char *)current + BLOCK_SIZE + size);
+                new_block->size = remaining - BLOCK_SIZE;
                 new_block->free = 1;
                 new_block->next = current->next;
+
                 current->next = new_block;
                 current->size = size;
             }
 
             current->free = 0;
             pthread_mutex_unlock(&mem_lock);
-            // return pointer inside pool
             return (void *)(current + 1);
         }
         current = current->next;
@@ -79,7 +84,7 @@ void *mem_alloc(size_t size) {
 }
 
 /**
- * Frees a block within the pool and merges adjacent free blocks.
+ * Frees a previously allocated block and merges adjacent free blocks.
  */
 void mem_free(void *ptr) {
     if (!ptr)
@@ -90,7 +95,7 @@ void mem_free(void *ptr) {
     Block *block = (Block *)ptr - 1;
     block->free = 1;
 
-    // merge adjacent free blocks
+    // Merge adjacent free blocks
     Block *curr = free_list;
     while (curr && curr->next) {
         if (curr->free && curr->next->free) {
@@ -105,7 +110,7 @@ void mem_free(void *ptr) {
 }
 
 /**
- * Reallocates a block (alloc + copy + free).
+ * Resizes a block (realloc-style).
  */
 void *mem_resize(void *ptr, size_t size) {
     if (!ptr)
@@ -124,8 +129,7 @@ void *mem_resize(void *ptr, size_t size) {
 }
 
 /**
- * Deinitializes memory manager (munmap pool).
- * Called by test_memory_manager at the very end.
+ * Deinitializes the memory manager and releases mmap region.
  */
 void mem_deinit(void) {
     pthread_mutex_lock(&mem_lock);
