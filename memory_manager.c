@@ -2,8 +2,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <pthread.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 typedef struct Block {
     size_t size;
@@ -19,12 +20,13 @@ static Block *free_list = NULL;
 static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /**
- * Initializes the memory manager with a given pool size using mmap().
+ * Initialize memory pool using mmap.
  */
 void mem_init(size_t size) {
     pthread_mutex_init(&mem_lock, NULL);
 
     pool_size = size;
+
     memory_pool = mmap(NULL, pool_size,
                        PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -34,7 +36,7 @@ void mem_init(size_t size) {
         exit(EXIT_FAILURE);
     }
 
-    // Set up the first free block
+    // first free block in pool
     free_list = (Block *)memory_pool;
     free_list->size = pool_size - BLOCK_SIZE;
     free_list->free = 1;
@@ -42,8 +44,7 @@ void mem_init(size_t size) {
 }
 
 /**
- * Allocates a block of memory from the custom pool.
- * Uses a simple first-fit algorithm.
+ * First-fit allocation from pool (no malloc allowed).
  */
 void *mem_alloc(size_t size) {
     pthread_mutex_lock(&mem_lock);
@@ -52,8 +53,8 @@ void *mem_alloc(size_t size) {
 
     while (current != NULL) {
         if (current->free && current->size >= size) {
-            // If the block is big enough to split
-            if (current->size > size + BLOCK_SIZE) {
+            // split if block is large
+            if (current->size >= size + BLOCK_SIZE + 1) {
                 Block *new_block = (Block *)((char *)(current + 1) + size);
                 new_block->size = current->size - size - BLOCK_SIZE;
                 new_block->free = 1;
@@ -61,7 +62,6 @@ void *mem_alloc(size_t size) {
                 current->next = new_block;
                 current->size = size;
             }
-
             current->free = 0;
             pthread_mutex_unlock(&mem_lock);
             return (void *)(current + 1);
@@ -75,52 +75,52 @@ void *mem_alloc(size_t size) {
 }
 
 /**
- * Frees a previously allocated block and merges adjacent free blocks.
+ * Free a block and merge adjacent free blocks.
  */
-void mem_free(void *block) {
-    if (!block)
+void mem_free(void *ptr) {
+    if (!ptr)
         return;
 
     pthread_mutex_lock(&mem_lock);
 
-    Block *curr = (Block *)block - 1;
-    curr->free = 1;
+    Block *block = (Block *)ptr - 1;
+    block->free = 1;
 
-    // Merge adjacent free blocks
-    Block *temp = free_list;
-    while (temp) {
-        if (temp->free && temp->next && temp->next->free) {
-            temp->size += BLOCK_SIZE + temp->next->size;
-            temp->next = temp->next->next;
+    // merge neighbors
+    Block *curr = free_list;
+    while (curr) {
+        if (curr->free && curr->next && curr->next->free) {
+            curr->size += BLOCK_SIZE + curr->next->size;
+            curr->next = curr->next->next;
             continue;
         }
-        temp = temp->next;
+        curr = curr->next;
     }
 
     pthread_mutex_unlock(&mem_lock);
 }
 
 /**
- * Resizes a block (naive version: allocates new memory, copies data, frees old).
+ * Resize a block (simple version).
  */
-void *mem_resize(void *block, size_t size) {
-    if (!block)
+void *mem_resize(void *ptr, size_t size) {
+    if (!ptr)
         return mem_alloc(size);
 
-    Block *old_block = (Block *)block - 1;
-    if (old_block->size >= size)
-        return block;
+    Block *old = (Block *)ptr - 1;
+    if (old->size >= size)
+        return ptr;
 
-    void *new_block = mem_alloc(size);
-    if (new_block) {
-        memcpy(new_block, block, old_block->size);
-        mem_free(block);
+    void *new_ptr = mem_alloc(size);
+    if (new_ptr) {
+        memcpy(new_ptr, ptr, old->size);
+        mem_free(ptr);
     }
-    return new_block;
+    return new_ptr;
 }
 
 /**
- * Deinitializes the memory pool (munmap).
+ * Deinitialize memory manager and free mmap region.
  */
 void mem_deinit(void) {
     if (memory_pool) {
