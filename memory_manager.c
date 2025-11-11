@@ -1,103 +1,217 @@
+// memory_manager.c
 #include "memory_manager.h"
-#include <stdio.h>
-#include <stdlib.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include <pthread.h>
 
-#define BLOCK_SIZE 512  // Fixed block size for simplicity
-#define NUM_BLOCKS (6000 / BLOCK_SIZE)  // 11 blocks (6000 / 512 = 11.718, ignore rest)
+/* ============================
+   Enkel first-fit allokator över en statisk arena.
+   - Ingen malloc/mmap används.
+   - Blocklayout: [Header][payload]
+   - Header är inuti arenan, så vi kan traversera och koalescera.
+   ============================ */
 
-static void* memory_pool = NULL;
-static size_t pool_size = 0;
-static int free_blocks[NUM_BLOCKS];  // 1 = free, 0 = allocated
-static int next_free = 0;  // Next free block index
-static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
+#define MAX_POOL_SIZE   (1u << 20)  /* 1 MiB arena som övre gräns – vi använder bara de första `pool_size` byten */
+#define ALIGNMENT       8u
 
-/**
- * Initializes the memory manager with a pool of the given size.
- */
+typedef struct BlockHeader {
+    size_t size;                 /* storlek på payload i byte (exkl. header) */
+    uint8_t free;                /* 1 = fri, 0 = allokerad */
+    struct BlockHeader* next;    /* nästa block i listan */
+} BlockHeader;
+
+/* ---- Global arena + metadata ---- */
+static uint8_t       g_pool[MAX_POOL_SIZE];   /* statiskt allokerad – inga systemanrop */
+static size_t        g_pool_size = 0;         /* hur mycket av arenan som mem_init() aktiverade */
+static BlockHeader*  g_head = NULL;           /* första blocket */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ---- Hjälpfunktioner ---- */
+static inline size_t align_up(size_t n) {
+    size_t r = (n + (ALIGNMENT - 1u)) & ~(ALIGNMENT - 1u);
+    return r;
+}
+
+static inline size_t header_size(void) {
+    return align_up(sizeof(BlockHeader));
+}
+
+static void split_block(BlockHeader* blk, size_t need) {
+    /* Förutsätter: blk->free == 1, blk->size >= need */
+    size_t hsz = header_size();
+    if (blk->size >= need + hsz + ALIGNMENT) {
+        /* Skapa ett nytt block efter payloaden */
+        uint8_t* base = (uint8_t*)blk;
+        BlockHeader* newblk = (BlockHeader*)(base + hsz + need);
+        newblk->size = blk->size - need - hsz;
+        newblk->free = 1;
+        newblk->next = blk->next;
+
+        blk->size = need;
+        blk->next = newblk;
+    }
+    /* annars låter vi blocket vara “tight” utan split */
+}
+
+static void try_coalesce(BlockHeader* blk) {
+    while (blk && blk->next && blk->free && blk->next->free) {
+        BlockHeader* nxt = blk->next;
+        blk->size += header_size() + nxt->size;
+        blk->next = nxt->next;
+    }
+}
+
+/* ---- Publika funktioner ---- */
+
 void mem_init(size_t size) {
-    pthread_mutex_lock(&mem_lock);
-    if (memory_pool) {
-        pthread_mutex_unlock(&mem_lock);
+    pthread_mutex_lock(&g_lock);
+
+    if (g_head != NULL) {
+        /* redan initierad – idempotent */
+        pthread_mutex_unlock(&g_lock);
         return;
     }
-    pool_size = size;
-    memory_pool = malloc(pool_size);
-    if (!memory_pool) {
-        perror("malloc failed");
-        pthread_mutex_unlock(&mem_lock);
-        exit(EXIT_FAILURE);
+
+    if (size == 0 || size > MAX_POOL_SIZE) {
+        /* klipp till giltig storlek */
+        if (size == 0) size = ALIGNMENT;      /* minimal */
+        if (size > MAX_POOL_SIZE) size = MAX_POOL_SIZE;
     }
-    for (int i = 0; i < NUM_BLOCKS; i++) {
-        free_blocks[i] = 1;  // All free
-    }
-    next_free = 0;
-    pthread_mutex_unlock(&mem_lock);
+
+    g_pool_size = align_up(size);
+
+    /* Skapa ett stort fritt block över hela aktiva arenan */
+    g_head = (BlockHeader*)g_pool;
+    g_head->size = g_pool_size - header_size();
+    g_head->free = 1u;
+    g_head->next = NULL;
+
+    pthread_mutex_unlock(&g_lock);
 }
 
-/**
- * Allocates a fixed 512-byte block.
- */
 void* mem_alloc(size_t size) {
-    pthread_mutex_lock(&mem_lock);
-    if (!memory_pool || size == 0 || size > BLOCK_SIZE) {
-        pthread_mutex_unlock(&mem_lock);
-        return NULL;  // Only support 512 bytes
+    if (size == 0) return NULL;
+
+    pthread_mutex_lock(&g_lock);
+
+    size_t need = align_up(size);
+    BlockHeader* cur = g_head;
+
+    while (cur) {
+        if (cur->free && cur->size >= need) {
+            split_block(cur, need);
+            cur->free = 0u;
+            void* payload = (uint8_t*)cur + header_size();
+            pthread_mutex_unlock(&g_lock);
+            return payload;
+        }
+        cur = cur->next;
     }
-    if (next_free >= NUM_BLOCKS) {
-        pthread_mutex_unlock(&mem_lock);
-        return NULL;  // No free blocks
-    }
-    int block_index = next_free;
-    free_blocks[block_index] = 0;
-    // Find next free
-    next_free++;
-    while (next_free < NUM_BLOCKS && !free_blocks[next_free]) {
-        next_free++;
-    }
-    pthread_mutex_unlock(&mem_lock);
-    return (char*)memory_pool + block_index * BLOCK_SIZE;  // Start at base + index * 512
+
+    pthread_mutex_unlock(&g_lock);
+    return NULL; /* inget block stort nog */
 }
 
-/**
- * Frees a block (mark as free).
- */
 void mem_free(void* ptr) {
     if (!ptr) return;
-    pthread_mutex_lock(&mem_lock);
-    int block_index = ((char*)ptr - (char*)memory_pool) / BLOCK_SIZE;
-    if (block_index >= 0 && block_index < NUM_BLOCKS) {
-        free_blocks[block_index] = 1;
-        if (block_index < next_free) next_free = block_index;  // Update next_free
+
+    pthread_mutex_lock(&g_lock);
+
+    /* Header ligger precis före payloaden */
+    BlockHeader* blk = (BlockHeader*)((uint8_t*)ptr - header_size());
+
+    /* Grundläggande sanity: blocket måste ligga inom vår aktiva arena */
+    uint8_t* pool_begin = g_pool;
+    uint8_t* pool_end   = g_pool + g_pool_size;
+    if ((uint8_t*)blk < pool_begin || (uint8_t*)blk >= pool_end) {
+        /* utanför arenan – ignorera tyst eller logga vid behov */
+        pthread_mutex_unlock(&g_lock);
+        return;
     }
-    pthread_mutex_unlock(&mem_lock);
+
+    blk->free = 1u;
+
+    /* Koalescera: hitta föregångare för att kunna slå ihop i båda riktningar */
+    BlockHeader* cur = g_head;
+    BlockHeader* prev = NULL;
+
+    while (cur) {
+        if (cur == blk) {
+            /* försök slå ihop höger */
+            try_coalesce(cur);
+            /* försök slå ihop vänster (om prev är fri) */
+            if (prev && prev->free) {
+                try_coalesce(prev); /* prev och cur slås ihop inuti */
+            }
+            break;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+
+    pthread_mutex_unlock(&g_lock);
 }
 
-/**
- * Resizes a block (simplified).
- */
-void* mem_resize(void* ptr, size_t size) {
-    if (!ptr) return mem_alloc(size);
-    if (size <= BLOCK_SIZE) return ptr;  // Can't resize larger
-    void* new_ptr = mem_alloc(size);
-    if (new_ptr) {
-        memcpy(new_ptr, ptr, BLOCK_SIZE);
-        mem_free(ptr);
+void* mem_resize(void* ptr, size_t new_size) {
+    if (ptr == NULL) {
+        return mem_alloc(new_size);
     }
+    if (new_size == 0) {
+        mem_free(ptr);
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_lock);
+
+    size_t need = align_up(new_size);
+    BlockHeader* blk = (BlockHeader*)((uint8_t*)ptr - header_size());
+
+    /* Om blocket redan är stort nog – behåll (ev. split för att minska slöseri) */
+    if (blk->size >= need) {
+        split_block(blk, need);
+        pthread_mutex_unlock(&g_lock);
+        return ptr;
+    }
+
+    /* Försök expandera in-place om nästa är fritt och tillsammans räcker */
+    if (blk->next && blk->next->free) {
+        size_t combined = blk->size + header_size() + blk->next->size;
+        if (combined >= need) {
+            /* “Låna” från nästa block */
+            BlockHeader* nxt = blk->next;
+            blk->size = combined;
+            blk->next = nxt->next;
+            /* Efter utökning, ev. split för att lämna rest som fritt block */
+            split_block(blk, need);
+            pthread_mutex_unlock(&g_lock);
+            return (uint8_t*)blk + header_size();
+        }
+    }
+
+    /* Annars: allokera nytt block, kopiera, fria gamla */
+    pthread_mutex_unlock(&g_lock);
+
+    void* new_ptr = mem_alloc(need);
+    if (!new_ptr) {
+        return NULL;
+    }
+
+    /* Kopiera min(old_size, need). Vi känner inte old_size externt, så läs header igen. */
+    pthread_mutex_lock(&g_lock);
+    size_t old_size = blk->size;
+    pthread_mutex_unlock(&g_lock);
+
+    size_t to_copy = old_size < need ? old_size : need;
+    memcpy(new_ptr, ptr, to_copy);
+    mem_free(ptr);
     return new_ptr;
 }
 
-/**
- * Deinitializes.
- */
 void mem_deinit(void) {
-    pthread_mutex_lock(&mem_lock);
-    if (memory_pool) {
-        free(memory_pool);
-        memory_pool = NULL;
-        pool_size = 0;
-        next_free = 0;
-    }
-    pthread_mutex_unlock(&mem_lock);
+    pthread_mutex_lock(&g_lock);
+    /* Nollställ metadata – arenan är statisk, så inget att “free:a” */
+    g_head = NULL;
+    g_pool_size = 0;
+    pthread_mutex_unlock(&g_lock);
 }
