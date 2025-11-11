@@ -1,5 +1,5 @@
 # ===========================================
-#  CROSS-PLATFORM MAKEFILE (Linux / CodeGrade)
+#  FINAL FIXED MAKEFILE for CodeGrade (Linux)
 # ===========================================
 
 CC = gcc
@@ -10,23 +10,30 @@ LIBNAME = libmemory_manager.so
 # -------------------------------------------
 # Default rule: build both library and app
 # -------------------------------------------
-all: mmanager list
+all: $(LIBNAME) $(APPNAME)
 
-
-mmanager: memory_manager.c memory_manager.h
+# -------------------------------------------
+# Build shared library (.so)
+# -------------------------------------------
+$(LIBNAME): memory_manager.c memory_manager.h
 	$(CC) $(CFLAGS) -shared -o $(LIBNAME) memory_manager.c
 
+# -------------------------------------------
+# Build linked list app (link with .so)
+# -------------------------------------------
+$(APPNAME): linked_list.c linked_list.h main.c $(LIBNAME)
+	$(CC) $(CFLAGS) -I. -L. -Wl,-rpath=$(PWD) -o $(APPNAME) linked_list.c main.c -l:$(LIBNAME)
 
-list: linked_list.c linked_list.h main.c
-	$(CC) $(CFLAGS) -I. -L. -Wl,-rpath=. -lmemory_manager -o $(APPNAME) linked_list.c main.c
-
-
+# -------------------------------------------
+# Clean up
+# -------------------------------------------
 clean:
 	rm -f $(APPNAME) $(LIBNAME) *.o
 
-
+# -------------------------------------------
+# Run (for local testing)
+# -------------------------------------------
 run: all
 	./$(APPNAME)
 
-.PHONY: all mmanager list clean run
-
+.PHONY: all clean run
