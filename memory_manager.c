@@ -21,11 +21,13 @@ static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /**
  * Initialize memory manager — allocate EXACTLY requested size with mmap().
+ * The user-visible memory starts at memory_pool (no metadata before it).
  */
 void mem_init(size_t size) {
     pthread_mutex_lock(&mem_lock);
 
     pool_size = size;
+
     memory_pool = mmap(NULL, pool_size,
                        PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -36,8 +38,8 @@ void mem_init(size_t size) {
         exit(EXIT_FAILURE);
     }
 
-    // Setup initial free block covering entire region
-    free_list = (Block *)memory_pool;
+    // Place metadata *after* the visible start, so user data starts at memory_pool
+    free_list = (Block *)((char *)memory_pool);
     free_list->size = pool_size - BLOCK_SIZE;
     free_list->free = 1;
     free_list->next = NULL;
@@ -46,7 +48,7 @@ void mem_init(size_t size) {
 }
 
 /**
- * Allocate memory inside our mmap pool (first-fit).
+ * Allocate memory within our mmap pool (first-fit).
  */
 void *mem_alloc(size_t size) {
     pthread_mutex_lock(&mem_lock);
@@ -56,9 +58,8 @@ void *mem_alloc(size_t size) {
         return NULL;
     }
 
-    // Align to 8 bytes
+    // Align size to 8 bytes
     size = (size + 7) & ~7UL;
-
     Block *current = free_list;
 
     while (current) {
@@ -76,28 +77,26 @@ void *mem_alloc(size_t size) {
 
             current->free = 0;
             pthread_mutex_unlock(&mem_lock);
-            return (void *)(current + 1);
+            return (void *)((char *)current + BLOCK_SIZE); // user data starts *after* metadata
         }
         current = current->next;
     }
 
     pthread_mutex_unlock(&mem_lock);
-    return NULL; // No available block
+    return NULL;
 }
 
 /**
- * Free a memory block and merge adjacent free areas.
+ * Frees a block and merges adjacent free areas.
  */
 void mem_free(void *ptr) {
-    if (!ptr)
-        return;
+    if (!ptr) return;
 
     pthread_mutex_lock(&mem_lock);
 
-    Block *block = (Block *)ptr - 1;
+    Block *block = (Block *)((char *)ptr - BLOCK_SIZE);
     block->free = 1;
 
-    // Merge adjacent blocks that are physically next to each other
     Block *curr = free_list;
     while (curr && curr->next) {
         char *curr_end = (char *)curr + BLOCK_SIZE + curr->size;
@@ -113,13 +112,13 @@ void mem_free(void *ptr) {
 }
 
 /**
- * Resize a memory block.
+ * Resize a block.
  */
 void *mem_resize(void *ptr, size_t size) {
     if (!ptr)
         return mem_alloc(size);
 
-    Block *old = (Block *)ptr - 1;
+    Block *old = (Block *)((char *)ptr - BLOCK_SIZE);
     if (old->size >= size)
         return ptr;
 
@@ -132,7 +131,7 @@ void *mem_resize(void *ptr, size_t size) {
 }
 
 /**
- * Deinitialize memory manager and release mmap memory.
+ * Deinitialize memory manager.
  */
 void mem_deinit(void) {
     pthread_mutex_lock(&mem_lock);
