@@ -1,40 +1,37 @@
-# ===========================================
-# DV1727 - Thread-Safe Memory Manager (Final Fix)
-# ===========================================
-
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c11 -fPIC -pthread
-LIB_NAME = libmemory_manager.so
-APPNAME = linked_list_app
+CFLAGS = -Wall -Wextra -fPIC -pthread -g
+LDFLAGS = -pthread
 
-# Default target
-all: $(LIB_NAME) $(APPNAME)
+# memory manager library
+MM_SRC = memory_manager.c
+MM_LIB = libmemory_manager.so
 
-# -------------------------------------------
-# Build shared memory manager library
-# -------------------------------------------
-$(LIB_NAME): memory_manager.c memory_manager.h
-	$(CC) $(CFLAGS) -shared -o $(LIB_NAME) memory_manager.c
+# linked list app
+LIST_SRC = linked_list.c test_linked_list.c
+LIST_EXE = test_linked_list
 
-# -------------------------------------------
-# Build linked list app (for your local testing)
-# -------------------------------------------
-$(APPNAME): linked_list.c linked_list.h main.c $(LIB_NAME)
-	$(CC) $(CFLAGS) -I. -L. -Wl,-rpath=$(PWD) -o $(APPNAME) linked_list.c main.c -l:$(LIB_NAME)
+# memory manager test
+MM_TEST_SRC = test_memory_manager.c
+MM_TEST_EXE = test_memory_manager
 
-# -------------------------------------------
-# Required by CodeGrade — this is what they test
-# -------------------------------------------
-list: linked_list.o
-	$(CC) $(CFLAGS) -I. -L. -Wl,-rpath=$(PWD) -o test_linked_list linked_list.c -l:$(LIB_NAME) -ldl -lm
+.PHONY: all clean mmanager list mmtest
 
-test_memory_manager: $(LIB_NAME)
-	$(CC) $(CFLAGS) -Wl,-rpath=$(PWD) -o test_memory_manager test_memory_manager.c -L. -lmemory_manager -lm
+all: mmanager list mmtest
 
-# -------------------------------------------
-# Clean up
-# -------------------------------------------
+mmanager: $(MM_LIB)
+
+$(MM_LIB): $(MM_SRC)
+	$(CC) $(CFLAGS) -shared -o $(MM_LIB) $(MM_SRC)
+
+list: $(LIST_EXE)
+
+$(LIST_EXE): $(LIST_SRC) $(MM_LIB)
+	$(CC) $(CFLAGS) -o $(LIST_EXE) $(LIST_SRC) -L. -lmemory_manager $(LDFLAGS) -lm -Wl,-rpath,.
+
+mmtest: $(MM_TEST_EXE)
+
+$(MM_TEST_EXE): $(MM_TEST_SRC) $(MM_LIB)
+	$(CC) $(CFLAGS) -o $(MM_TEST_EXE) $(MM_TEST_SRC) -L. -lmemory_manager $(LDFLAGS) -lm -Wl,-rpath,.
+
 clean:
-	rm -f $(APPNAME) $(LIB_NAME) test_linked_list test_memory_manager *.o
-
-.PHONY: all clean list test_memory_manager
+	rm -f *.o $(MM_LIB) $(LIST_EXE) $(MM_TEST_EXE)
