@@ -26,8 +26,6 @@ void mem_init(size_t size) {
     pthread_mutex_lock(&mem_lock);
 
     pool_size = size;
-
-    // Allocate a contiguous region of memory using mmap()
     memory_pool = mmap(NULL, pool_size,
                        PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -38,7 +36,7 @@ void mem_init(size_t size) {
         exit(EXIT_FAILURE);
     }
 
-    // Create the first free block
+    // Setup initial free block covering entire region
     free_list = (Block *)memory_pool;
     free_list->size = pool_size - BLOCK_SIZE;
     free_list->free = 1;
@@ -48,7 +46,7 @@ void mem_init(size_t size) {
 }
 
 /**
- * Allocate memory within our mmap pool (first-fit strategy).
+ * Allocate memory inside our mmap pool (first-fit).
  */
 void *mem_alloc(size_t size) {
     pthread_mutex_lock(&mem_lock);
@@ -58,10 +56,12 @@ void *mem_alloc(size_t size) {
         return NULL;
     }
 
-    size = (size + 7) & ~7UL; // Align to 8 bytes
+    // Align to 8 bytes
+    size = (size + 7) & ~7UL;
+
     Block *current = free_list;
 
-    while (current != NULL) {
+    while (current) {
         if (current->free && current->size >= size) {
             size_t remaining = current->size - size;
 
@@ -82,12 +82,11 @@ void *mem_alloc(size_t size) {
     }
 
     pthread_mutex_unlock(&mem_lock);
-    printf("mem_alloc: inget ledigt minne\n");
-    return NULL;
+    return NULL; // No available block
 }
 
 /**
- * Frees a block and merges adjacent free areas.
+ * Free a memory block and merge adjacent free areas.
  */
 void mem_free(void *ptr) {
     if (!ptr)
@@ -98,15 +97,16 @@ void mem_free(void *ptr) {
     Block *block = (Block *)ptr - 1;
     block->free = 1;
 
-    // Merge adjacent blocks
+    // Merge adjacent blocks that are physically next to each other
     Block *curr = free_list;
     while (curr && curr->next) {
-        if (curr->free && curr->next->free) {
+        char *curr_end = (char *)curr + BLOCK_SIZE + curr->size;
+        if (curr->free && curr->next->free && curr_end == (char *)curr->next) {
             curr->size += BLOCK_SIZE + curr->next->size;
             curr->next = curr->next->next;
-        } else {
-            curr = curr->next;
+            continue;
         }
+        curr = curr->next;
     }
 
     pthread_mutex_unlock(&mem_lock);
@@ -132,7 +132,7 @@ void *mem_resize(void *ptr, size_t size) {
 }
 
 /**
- * Deinitialize the memory manager and release mmap memory.
+ * Deinitialize memory manager and release mmap memory.
  */
 void mem_deinit(void) {
     pthread_mutex_lock(&mem_lock);
