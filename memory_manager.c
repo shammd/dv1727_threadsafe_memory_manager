@@ -1,154 +1,133 @@
 #include "memory_manager.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
+#include <sys/mman.h>
 #include <pthread.h>
 
-// Strukturen som beskriver ett block i minnespoolen
 typedef struct Block {
-    size_t size;          // Storlek på blocket
-    int free;             // 1 = ledigt och 0 = upptaget
-    struct Block* next;   // Pekare till nästa block
+    size_t size;
+    int free;
+    struct Block *next;
 } Block;
-
-static void* memory_pool = NULL;   // Själva minnespoolen
-static size_t pool_size = 0;       // Total storlek
-static Block* free_list = NULL;    // Start på fria block
-static pthread_mutex_t mem_lock;   // Lås för trådsäkerhet
 
 #define BLOCK_SIZE sizeof(Block)
 
-// Initierar minneshanteraren med en pool av angiven storlek
-void mem_init(size_t size) {
-    if (memory_pool != NULL) {
-        fprintf(stderr, "Minneshanteraren är redan initierad!\n");
-        return;
-    }
+static void *memory_pool = NULL;
+static size_t pool_size = 0;
+static Block *free_list = NULL;
+static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
 
-    memory_pool = malloc(size);
-    if (!memory_pool) {
-        fprintf(stderr, "Kunde inte allokera minne!\n");
+/**
+ * Initializes the memory manager with a given pool size using mmap().
+ */
+void mem_init(size_t size) {
+    pthread_mutex_init(&mem_lock, NULL);
+
+    pool_size = size;
+    memory_pool = mmap(NULL, pool_size,
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    if (memory_pool == MAP_FAILED) {
+        perror("mmap failed");
         exit(EXIT_FAILURE);
     }
 
-    pool_size = size;
-    free_list = (Block*)memory_pool;
-    free_list->size = size - BLOCK_SIZE;
+    // Set up the first free block
+    free_list = (Block *)memory_pool;
+    free_list->size = pool_size - BLOCK_SIZE;
     free_list->free = 1;
     free_list->next = NULL;
-
-    pthread_mutex_init(&mem_lock, NULL);
 }
 
-// Hittar första lediga block som räcker (First-fit)
-static Block* find_free_block(size_t size) {
-    Block* current = free_list;
+/**
+ * Allocates a block of memory from the custom pool.
+ * Uses a simple first-fit algorithm.
+ */
+void *mem_alloc(size_t size) {
+    pthread_mutex_lock(&mem_lock);
+
+    Block *current = free_list;
+
     while (current != NULL) {
-        if (current->free && current->size >= size)
-            return current;
+        if (current->free && current->size >= size) {
+            // If the block is big enough to split
+            if (current->size > size + BLOCK_SIZE) {
+                Block *new_block = (Block *)((char *)(current + 1) + size);
+                new_block->size = current->size - size - BLOCK_SIZE;
+                new_block->free = 1;
+                new_block->next = current->next;
+                current->next = new_block;
+                current->size = size;
+            }
+
+            current->free = 0;
+            pthread_mutex_unlock(&mem_lock);
+            return (void *)(current + 1);
+        }
         current = current->next;
     }
+
+    pthread_mutex_unlock(&mem_lock);
+    printf("mem_alloc: inget ledigt minne\n");
     return NULL;
 }
 
-// Delar upp ett block om det är större än nödvändigt
-static void split_block(Block* block, size_t size) {
-    if (block->size <= size + BLOCK_SIZE)
+/**
+ * Frees a previously allocated block and merges adjacent free blocks.
+ */
+void mem_free(void *block) {
+    if (!block)
         return;
 
-    Block* new_block = (Block*)((char*)block + BLOCK_SIZE + size);
-    new_block->size = block->size - size - BLOCK_SIZE;
-    new_block->free = 1;
-    new_block->next = block->next;
-
-    block->size = size;
-    block->next = new_block;
-}
-
-// Allokerar minne från poolen
-void* mem_alloc(size_t size) {
-    if (size == 0) return NULL;
     pthread_mutex_lock(&mem_lock);
 
-    Block* block = find_free_block(size);
-    if (!block) {
-        pthread_mutex_unlock(&mem_lock);
-        fprintf(stderr, "mem_alloc: inget ledigt minne\n");
-        return NULL;
-    }
+    Block *curr = (Block *)block - 1;
+    curr->free = 1;
 
-    split_block(block, size);
-    block->free = 0;
-
-    pthread_mutex_unlock(&mem_lock);
-    return (char*)block + BLOCK_SIZE;
-}
-
-// Slår ihop fria block efter frigöring
-static void merge_free_blocks() {
-    Block* current = free_list;
-    while (current && current->next) {
-        Block* next = current->next;
-        if (current->free && next->free) {
-            current->size += BLOCK_SIZE + next->size;
-            current->next = next->next;
-        } else {
-            current = current->next;
+    // Merge adjacent free blocks
+    Block *temp = free_list;
+    while (temp) {
+        if (temp->free && temp->next && temp->next->free) {
+            temp->size += BLOCK_SIZE + temp->next->size;
+            temp->next = temp->next->next;
+            continue;
         }
+        temp = temp->next;
     }
-}
-
-// Frigör ett block
-void mem_free(void* ptr) {
-    if (!ptr) return;
-    pthread_mutex_lock(&mem_lock);
-
-    Block* block = (Block*)((char*)ptr - BLOCK_SIZE);
-    if (block->free) {
-        fprintf(stderr, "Varning: dubbel frigöring!\n");
-        pthread_mutex_unlock(&mem_lock);
-        return;
-    }
-
-    block->free = 1;
-    merge_free_blocks();
 
     pthread_mutex_unlock(&mem_lock);
 }
 
-// Ändra storleken på ett block (om nödvändigt)
-void* mem_resize(void* ptr, size_t size) {
-    if (!ptr) return mem_alloc(size);
-    if (size == 0) {
-        mem_free(ptr);
-        return NULL;
+/**
+ * Resizes a block (naive version: allocates new memory, copies data, frees old).
+ */
+void *mem_resize(void *block, size_t size) {
+    if (!block)
+        return mem_alloc(size);
+
+    Block *old_block = (Block *)block - 1;
+    if (old_block->size >= size)
+        return block;
+
+    void *new_block = mem_alloc(size);
+    if (new_block) {
+        memcpy(new_block, block, old_block->size);
+        mem_free(block);
     }
-
-    pthread_mutex_lock(&mem_lock);
-    Block* block = (Block*)((char*)ptr - BLOCK_SIZE);
-    if (block->size >= size) {
-        pthread_mutex_unlock(&mem_lock);
-        return ptr;
-    }
-    pthread_mutex_unlock(&mem_lock);
-
-    void* new_ptr = mem_alloc(size);
-    if (!new_ptr) return NULL;
-
-    memcpy(new_ptr, ptr, block->size);
-    mem_free(ptr);
-    return new_ptr;
+    return new_block;
 }
 
-// Rensar hela minnespoolen
-void mem_deinit() {
-    pthread_mutex_lock(&mem_lock);
+/**
+ * Deinitializes the memory pool (munmap).
+ */
+void mem_deinit(void) {
     if (memory_pool) {
-        free(memory_pool);
+        munmap(memory_pool, pool_size);
         memory_pool = NULL;
         free_list = NULL;
         pool_size = 0;
     }
-    pthread_mutex_unlock(&mem_lock);
     pthread_mutex_destroy(&mem_lock);
 }
