@@ -1,39 +1,37 @@
-# ===========================================
-#  FINAL FIXED MAKEFILE for CodeGrade (Linux)
-# ===========================================
-
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c11 -fPIC -pthread
-APPNAME = linked_list_app
-LIBNAME = libmemory_manager.so
+CFLAGS = -Wall -Wextra -fPIC -pthread -g
+LDFLAGS = -pthread
 
-# -------------------------------------------
-# Default rule: build both library and app
-# -------------------------------------------
-all: $(LIBNAME) $(APPNAME)
+# memory manager library
+MM_SRC = memory_manager.c
+MM_LIB = libmemory_manager.so
 
-# -------------------------------------------
-# Build shared library (.so)
-# -------------------------------------------
-$(LIBNAME): memory_manager.c memory_manager.h
-	$(CC) $(CFLAGS) -shared -o $(LIBNAME) memory_manager.c
+# linked list app
+LIST_SRC = linked_list.c test_linked_list.c
+LIST_EXE = test_linked_list
 
-# -------------------------------------------
-# Build linked list app (link with .so)
-# -------------------------------------------
-$(APPNAME): linked_list.c linked_list.h main.c $(LIBNAME)
-	$(CC) $(CFLAGS) -I. -L. -Wl,-rpath=$(PWD) -o $(APPNAME) linked_list.c main.c -l:$(LIBNAME)
+# memory manager test
+MM_TEST_SRC = test_memory_manager.c
+MM_TEST_EXE = test_memory_manager
 
-# -------------------------------------------
-# Clean up
-# -------------------------------------------
+.PHONY: all clean mmanager list mmtest
+
+all: mmanager list mmtest
+
+mmanager: $(MM_LIB)
+
+$(MM_LIB): $(MM_SRC)
+	$(CC) $(CFLAGS) -shared -o $(MM_LIB) $(MM_SRC)
+
+list: $(LIST_EXE)
+
+$(LIST_EXE): $(LIST_SRC) $(MM_LIB)
+	$(CC) $(CFLAGS) -o $(LIST_EXE) $(LIST_SRC) -L. -lmemory_manager $(LDFLAGS) -lm -Wl,-rpath,.
+
+mmtest: $(MM_TEST_EXE)
+
+$(MM_TEST_EXE): $(MM_TEST_SRC) $(MM_LIB)
+	$(CC) $(CFLAGS) -o $(MM_TEST_EXE) $(MM_TEST_SRC) -L. -lmemory_manager $(LDFLAGS) -lm -Wl,-rpath,.
+
 clean:
-	rm -f $(APPNAME) $(LIBNAME) *.o
-
-# -------------------------------------------
-# Run (for local testing)
-# -------------------------------------------
-run: all
-	./$(APPNAME)
-
-.PHONY: all clean run
+	rm -f *.o $(MM_LIB) $(LIST_EXE) $(MM_TEST_EXE)
