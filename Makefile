@@ -1,5 +1,5 @@
 # ===========================================
-# CodeGrade-compatible Makefile (FINAL)
+# FINAL FIXED MAKEFILE for CodeGrade (Linux)
 # ===========================================
 
 CC = gcc
@@ -7,36 +7,31 @@ CFLAGS = -Wall -Wextra -std=c11 -fPIC -pthread
 LIBNAME = libmemory_manager.so
 APPNAME = linked_list_app
 
-# -------------------------------------------
-# Default rule: build library and app
-# -------------------------------------------
-all: $(LIBNAME) $(APPNAME)
+# Default target
+all: $(LIBNAME) $(APPNAME) test_linked_list
 
 # -------------------------------------------
-# Build the shared library (.so)
+# Shared library (Memory Manager)
 # -------------------------------------------
 $(LIBNAME): memory_manager.c memory_manager.h
 	$(CC) $(CFLAGS) -shared -o $(LIBNAME) memory_manager.c
 
 # -------------------------------------------
-# Build linked list app (your program)
+# Linked list application
 # -------------------------------------------
 $(APPNAME): linked_list.c linked_list.h main.c $(LIBNAME)
 	$(CC) $(CFLAGS) -I. -L. -Wl,-rpath=. -o $(APPNAME) linked_list.c main.c -l:$(LIBNAME)
 
 # -------------------------------------------
-# Build test binaries for CodeGrade (important!)
+# CodeGrade test target (links with cM2.c)
 # -------------------------------------------
-test_list: $(LIBNAME) linked_list.c test_linked_list.c
-	$(CC) $(CFLAGS) -I. -L. -Wl,-rpath=. -o test_linked_list linked_list.c test_linked_list.c -l:$(LIBNAME) -ldl -lm
-
-test_memory_manager: $(LIBNAME) test_memory_manager.c
-	$(CC) $(CFLAGS) -I. -L. -Wl,-rpath=. -o test_memory_manager test_memory_manager.c -l:$(LIBNAME) -ldl -lm
+test_linked_list: linked_list.c linked_list.h cM2.c common_defs.h memory_manager.c memory_manager.h
+	$(CC) $(CFLAGS) -I. -L. -Wl,-rpath=. -o test_linked_list linked_list.c cM2.c -l:$(LIBNAME)
 
 # -------------------------------------------
-# Clean up
+# Clean
 # -------------------------------------------
 clean:
-	rm -f $(APPNAME) $(LIBNAME) test_linked_list test_memory_manager *.o
+	rm -f $(APPNAME) $(LIBNAME) test_linked_list *.o
 
-.PHONY: all clean test_list test_memory_manager
+.PHONY: all clean
