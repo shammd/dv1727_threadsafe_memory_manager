@@ -1,38 +1,39 @@
-# ======================================
-#  Makefile för trådsäker minneshanterare
-#  och länkad lista (Windows + Linux)
-# ======================================
+# ===========================================
+#  FINAL FIXED MAKEFILE for CodeGrade (Linux)
+# ===========================================
 
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c11 -fPIC -pthread
-APP = linked_list_app
+APPNAME = linked_list_app
+LIBNAME = libmemory_manager.so
 
-# Kolla vilket OS som används (Windows_NT = Windows)
-ifeq ($(OS),Windows_NT)
-    LIB = memory_manager.dll
-    LINKFLAG = -l:memory_manager.dll
-else
-    LIB = libmemory_manager.so
-    LINKFLAG = -lmemory_manager
-endif
+# -------------------------------------------
+# Default rule: build both library and app
+# -------------------------------------------
+all: $(LIBNAME) $(APPNAME)
 
-# Standardkommandot: bygger både biblioteket och programmet
-all: mmanager list
+# -------------------------------------------
+# Build shared library (.so)
+# -------------------------------------------
+$(LIBNAME): memory_manager.c memory_manager.h
+	$(CC) $(CFLAGS) -shared -o $(LIBNAME) memory_manager.c
 
-# Bygger det dynamiska biblioteket för minneshanteraren
-mmanager: memory_manager.c memory_manager.h
-	$(CC) $(CFLAGS) -shared -o $(LIB) memory_manager.c
+# -------------------------------------------
+# Build linked list app (link with .so)
+# -------------------------------------------
+$(APPNAME): linked_list.c linked_list.h main.c $(LIBNAME)
+	$(CC) $(CFLAGS) -I. -L. -Wl,-rpath=$(PWD) -o $(APPNAME) linked_list.c main.c -l:$(LIBNAME)
 
-# Bygger huvudprogrammet och länkar mot biblioteket
-list: linked_list.c linked_list.h main.c
-	$(CC) $(CFLAGS) -L. $(LINKFLAG) -o $(APP) linked_list.c main.c -I.
-
-# Rensar bort allt som kompilerats
+# -------------------------------------------
+# Clean up
+# -------------------------------------------
 clean:
-	rm -f $(APP) $(LIB) *.o
+	rm -f $(APPNAME) $(LIBNAME) *.o
 
-# Kör programmet (bygger först om det behövs)
+# -------------------------------------------
+# Run (for local testing)
+# -------------------------------------------
 run: all
-	./$(APP)
+	./$(APPNAME)
 
-.PHONY: all mmanager list clean run
+.PHONY: all clean run
