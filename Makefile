@@ -1,51 +1,52 @@
-# ===============================
-# Thread-Safe Memory Manager + Linked List
-# ===============================
-
+# Compiler and Linking Variables
 CC = gcc
-CFLAGS = -Wall -Wextra -fPIC -pthread -g
-LDFLAGS = -pthread
+CFLAGS = -Wall -fPIC
 LIB_NAME = libmemory_manager.so
+PTHREAD_LIB = -pthread
 
-# --- Source Files ---
-MM_SRC = memory_manager.c
-LIST_SRC = linked_list.c
-TEST_MM_SRC = test_memory_manager.c
-TEST_LIST_SRC = test_linked_list.c
+# Source and Object Files
+SRC = memory_manager.c
+OBJ = $(SRC:.c=.o)
 
-# --- Output Files ---
-MM_LIB = $(LIB_NAME)
-TEST_MM = test_memory_manager
-TEST_LIST = test_linked_list
+# Default target
+all: gitinfo mmanager test_mmanager test_list
 
-.PHONY: all clean mmanager list test_memory_manager test_list run_tests
+# Rule to create the dynamic library
+$(LIB_NAME): $(OBJ)
+	$(CC) -shared -o $@ $(OBJ)
 
-# Default: build everything
-all: mmanager list test_memory_manager test_list
+# Rule to compile source files into object files
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
-# --- Build dynamic library ---
-mmanager: $(MM_LIB)
+# Git info (optional)
+gitinfo:
+	@echo "const char *git_date = \"$(GIT_DATE)\";" > gitdata.h
+	@echo "const char *git_sha = \"$(GIT_COMMIT)\";" >> gitdata.h
 
-$(MM_LIB): $(MM_SRC)
-	$(CC) $(CFLAGS) -shared -o $(MM_LIB) $(MM_SRC)
+# Build the memory manager library
+mmanager: $(LIB_NAME)
 
-# --- Build linked list app (non-test) ---
-list: $(LIST_SRC) $(MM_LIB)
-	$(CC) $(CFLAGS) -o linked_list $(LIST_SRC) -L. -lmemory_manager $(LDFLAGS) -lm -ldl -Wl,-rpath,.
+# Build linked list object
+linked_list.o: linked_list.c linked_list.h
+	$(CC) $(CFLAGS) -c linked_list.c -o linked_list.o $(PTHREAD_LIB)
 
-# --- Test: memory manager ---
-test_memory_manager: $(MM_LIB) $(TEST_MM_SRC)
-	$(CC) $(CFLAGS) -o $(TEST_MM) $(TEST_MM_SRC) -L. -lmemory_manager $(LDFLAGS) -lm -ldl -Wl,-rpath,.
+# Build and link test for memory manager
+test_mmanager: gitinfo $(LIB_NAME)
+	$(CC) $(CFLAGS) -o test_memory_manager test_memory_manager.c -L. -lmemory_manager -lm
 
-# --- Test: linked list ---
-test_list: $(MM_LIB) $(LIST_SRC) $(TEST_LIST_SRC)
-	$(CC) $(CFLAGS) -o $(TEST_LIST) $(LIST_SRC) $(TEST_LIST_SRC) -L. -lmemory_manager $(LDFLAGS) -lm -ldl -Wl,-rpath,.
+# Build and link test for linked list
+test_list: $(LIB_NAME) linked_list.o
+	$(CC) $(CFLAGS) -o test_linked_list linked_list.c test_linked_list.c -L. -lmemory_manager -lm $(PTHREAD_LIB)
 
-# --- Run all tests ---
-run_tests: test_memory_manager test_list
-	./$(TEST_MM)
-	./$(TEST_LIST)
+# Run test for memory manager
+run_test_mmanager:
+	@LD_LIBRARY_PATH=$$PWD ./test_memory_manager $${test}
 
-# --- Clean ---
+# Run test for linked list
+run_test_list:
+	@LD_LIBRARY_PATH=$$PWD ./test_linked_list
+
+# Clean target
 clean:
-	rm -f *.o $(MM_LIB) $(TEST_MM) $(TEST_LIST) linked_list
+	rm -f $(OBJ) $(LIB_NAME) test_memory_manager test_linked_list linked_list.o gitdata.h
