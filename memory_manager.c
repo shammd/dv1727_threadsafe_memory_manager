@@ -1,19 +1,8 @@
 #include "memory_manager.h"
 
-#include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
-
-#ifdef _WIN32
-  #include <windows.h>
-  #include <stdlib.h>
-  #define USE_MMAP 0
-#else
-  #include <sys/mman.h>
-  #include <unistd.h>
-  #include <stdlib.h>
-  #define USE_MMAP 1
-#endif
 
 // ---------------------------
 // Interna datastrukturer
@@ -27,12 +16,11 @@ typedef struct segment {
 } segment_t;
 
 // Vi lägger INTE metadata i poolen. Hela poolen är "user memory".
-// Tester som analyserar blockens gränser ser då en ren, tät packning.
 
 #define MAX_SEGMENTS 65536
 
 static segment_t segments[MAX_SEGMENTS];
-static segment_t *segment_head      = NULL; // första segmentet (beskriver poolen)
+static segment_t *segment_head      = NULL; // första segmentet
 static segment_t *segment_free_list = NULL; // fria metadata-noder
 
 static void  *memory_pool = NULL;
@@ -126,30 +114,18 @@ void mem_init(size_t size) {
 
     // Om mem_init anropas igen utan mem_deinit – städa gammalt.
     if (memory_pool != NULL) {
-#if USE_MMAP
-        munmap(memory_pool, pool_size);
-#else
         free(memory_pool);
-#endif
         memory_pool = NULL;
         pool_size   = 0;
+        segment_head = NULL;
+        segment_free_list = NULL;
     }
 
-#if USE_MMAP
-    void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (ptr == MAP_FAILED) {
-        pthread_mutex_unlock(&mem_lock);
-        return;
-    }
-    memory_pool = ptr;
-#else
     memory_pool = malloc(size);
     if (!memory_pool) {
         pthread_mutex_unlock(&mem_lock);
         return;
     }
-#endif
 
     pool_size = size;
 
@@ -157,12 +133,7 @@ void mem_init(size_t size) {
     reset_segments();
     segment_t *first = acquire_segment();
     if (!first) {
-        // orimligt, men clean up ifall
-#if USE_MMAP
-        munmap(memory_pool, pool_size);
-#else
         free(memory_pool);
-#endif
         memory_pool = NULL;
         pool_size   = 0;
         pthread_mutex_unlock(&mem_lock);
@@ -362,14 +333,10 @@ void mem_deinit(void) {
     pthread_mutex_lock(&mem_lock);
 
     if (memory_pool) {
-#if USE_MMAP
-        munmap(memory_pool, pool_size);
-#else
         free(memory_pool);
-#endif
-        memory_pool     = NULL;
-        pool_size       = 0;
-        segment_head    = NULL;
+        memory_pool       = NULL;
+        pool_size         = 0;
+        segment_head      = NULL;
         segment_free_list = NULL;
     }
 
