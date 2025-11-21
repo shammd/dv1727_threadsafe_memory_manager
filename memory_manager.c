@@ -12,70 +12,44 @@
 #include <unistd.h>
 #endif
 
-// --------- Blockstruktur i poolen ---------
-typedef struct block_header {
-    size_t size;                 // antal användbara bytes i blocket (exkl header)
-    int    free;                 // 1 = ledigt, 0 = upptaget
-    struct block_header* next;   // nästa block i poolen
-} block_header_t;
+// Segment beskriver en intervall i poolen: [start, start+size)
+typedef struct segment {
+    size_t start;              // offset från baspekaren (i bytes)
+    size_t size;               // längd (i bytes)
+    int    free;               // 1 = fri, 0 = allokerad
+    struct segment* next;
+} segment_t;
 
-// --------- Globala variabler ---------
-static void*          memory_pool = NULL;
-static size_t         pool_size   = 0;
-static block_header_t* first_block = NULL;
-static pthread_mutex_t mem_lock   = PTHREAD_MUTEX_INITIALIZER;
+static void*      memory_pool = NULL;
+static size_t     pool_size   = 0;
+static segment_t* seg_head    = NULL;
+static pthread_mutex_t mem_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #ifdef __linux__
-static int used_mmap = 0;
+static int used_mmap = 0;      // 1 om vi använde mmap, annars malloc
 #else
 static int used_mmap = 0;
 #endif
 
-// special-pekare för mem_alloc(0)
+// Särskild sentinel för size==0
 static char  zero_sentinel;
 static void* zero_ptr = &zero_sentinel;
 
-// --------- Hjälpfunktioner ---------
-#define ALIGN 8
-static size_t align_up(size_t s) {
-    return (s + (ALIGN - 1)) & ~(ALIGN - 1);
-}
-
-// kontroll att en header ligger inne i poolen
-static int header_in_pool(block_header_t* h) {
-    if (!memory_pool || pool_size == 0 || !h) return 0;
-    uint8_t* base = (uint8_t*)memory_pool;
-    uint8_t* end  = base + pool_size;
-    uint8_t* p    = (uint8_t*)h;
-    return (p >= base) && (p + sizeof(block_header_t) <= end);
-}
-
-static block_header_t* header_from_ptr(void* ptr) {
-    if (!ptr) return NULL;
-    block_header_t* h = (block_header_t*)((uint8_t*)ptr - sizeof(block_header_t));
-    if (!header_in_pool(h)) return NULL;
-    return h;
-}
-
-// slå ihop h med nästa block om det är fritt och ligger direkt efter
-static void coalesce_with_next(block_header_t* h) {
-    if (!h || !h->next) return;
-
-    block_header_t* n = h->next;
-    uint8_t* h_end = (uint8_t*)h + sizeof(block_header_t) + h->size;
-    if (n->free && (uint8_t*)n == h_end) {
-        h->size += sizeof(block_header_t) + n->size;
-        h->next  = n->next;
+// Hjälpfunktion: frigör all segment-metadata (inte poolen)
+static void free_segments(void) {
+    segment_t* cur = seg_head;
+    while (cur) {
+        segment_t* nxt = cur->next;
+        free(cur);
+        cur = nxt;
     }
+    seg_head = NULL;
 }
 
-// --------- API-funktioner ---------
-
-// initiera pool med exakt "size" bytes från OS (mmap eller malloc)
 void mem_init(size_t size) {
     pthread_mutex_lock(&mem_lock);
 
-    // om den redan är initierad, rensa först
+    // Städa ev. gammal pool
     if (memory_pool) {
 #ifdef __linux__
         if (used_mmap) {
@@ -88,11 +62,15 @@ void mem_init(size_t size) {
 #endif
         memory_pool = NULL;
         pool_size   = 0;
-        first_block = NULL;
+    }
+    free_segments();
+
+    if (size == 0) {
+        pthread_mutex_unlock(&mem_lock);
+        return;
     }
 
-    pool_size = size;
-
+    // Allokera poolen från OS (mmap på Linux, malloc fallback)
 #ifdef __linux__
     void* p = mmap(NULL, size,
                    PROT_READ | PROT_WRITE,
@@ -116,189 +94,217 @@ void mem_init(size_t size) {
     }
 
     memory_pool = p;
+    pool_size   = size;
 
-    // skapa första fria blocket som fyller hela poolen (minus header)
-    first_block        = (block_header_t*)memory_pool;
-    first_block->size  = (pool_size > sizeof(block_header_t))
-                           ? (pool_size - sizeof(block_header_t))
-                           : 0;
-    first_block->free  = 1;
-    first_block->next  = NULL;
+    // Start med ett stort fritt segment: [0, size)
+    segment_t* seg = (segment_t*)malloc(sizeof(segment_t));
+    if (!seg) {
+        perror("mem_init: segment malloc failed");
+#ifdef __linux__
+        if (used_mmap) munmap(memory_pool, pool_size);
+        else free(memory_pool);
+#else
+        free(memory_pool);
+#endif
+        memory_pool = NULL;
+        pool_size = 0;
+        pthread_mutex_unlock(&mem_lock);
+        exit(EXIT_FAILURE);
+    }
+    seg->start = 0;
+    seg->size  = size;
+    seg->free  = 1;
+    seg->next  = NULL;
+    seg_head   = seg;
 
     pthread_mutex_unlock(&mem_lock);
 }
 
-// allokera block; garanterar att om det finns ett sammanhängande ledigt block
-// som är tillräckligt stort så returneras INTE NULL.
 void* mem_alloc(size_t size) {
-    // specialfall: mem_alloc(0)
-    // CodeGrade förväntar sig: block1 != NULL och block1 == block2.
+    // Testerna vill att mem_alloc(0) returnerar
+    // *samma icke-NULL pekare* varje gång.
     if (size == 0) {
         return zero_ptr;
     }
-
-    if (!memory_pool || pool_size <= sizeof(block_header_t)) {
+    if (!memory_pool || pool_size == 0) {
         return NULL;
     }
 
-    size_t req = align_up(size);
-
     pthread_mutex_lock(&mem_lock);
 
-    block_header_t* curr = first_block;
-    while (curr) {
-        if (curr->free && curr->size >= req) {
-            // dela blocket om det blir en vettig rest
-            size_t remaining = curr->size - req;
-            if (remaining >= sizeof(block_header_t) + ALIGN) {
-                uint8_t* base = (uint8_t*)curr;
-                block_header_t* new_block =
-                    (block_header_t*)(base + sizeof(block_header_t) + req);
-                new_block->size = remaining - sizeof(block_header_t);
-                new_block->free = 1;
-                new_block->next = curr->next;
+    segment_t* cur = seg_head;
+    while (cur) {
+        if (cur->free && cur->size >= size) {
+            size_t alloc_start = cur->start;
 
-                curr->size = req;
-                curr->next = new_block;
+            if (cur->size == size) {
+                // Hela segmentet går till användaren
+                cur->free = 0;
+            } else {
+                // Splitta segmentet: [start, start+size) = alloc
+                // och [start+size, ...] = ny fri del
+                segment_t* new_free = (segment_t*)malloc(sizeof(segment_t));
+                if (!new_free) {
+                    pthread_mutex_unlock(&mem_lock);
+                    return NULL;
+                }
+                new_free->start = cur->start + size;
+                new_free->size  = cur->size - size;
+                new_free->free  = 1;
+                new_free->next  = cur->next;
+
+                cur->size = size;
+                cur->free = 0;
+                cur->next = new_free;
             }
 
-            curr->free = 0;
-            void* user_ptr = (uint8_t*)curr + sizeof(block_header_t);
+            uint8_t* base = (uint8_t*)memory_pool;
+            void* ptr = base + alloc_start;   // OBS: ingen metadata inne i poolen
             pthread_mutex_unlock(&mem_lock);
-            return user_ptr;
+            return ptr;
         }
-        curr = curr->next;
+        cur = cur->next;
     }
 
+    // Ingen plats
     pthread_mutex_unlock(&mem_lock);
-    return NULL; // inget block stort nog
+    return NULL;
 }
 
 void mem_free(void* ptr) {
     if (!ptr) return;
-    if (ptr == zero_ptr) return; // free på 0-pekaren gör ingenting
+    if (ptr == zero_ptr) return;
+    if (!memory_pool) return;
 
     pthread_mutex_lock(&mem_lock);
 
-    block_header_t* h = header_from_ptr(ptr);
-    if (!h) {
-        // pekaren tillhör inte vår pool; ignorera
+    uint8_t* base = (uint8_t*)memory_pool;
+    size_t off = (size_t)((uint8_t*)ptr - base);
+    if (off >= pool_size) {
         pthread_mutex_unlock(&mem_lock);
         return;
     }
 
-    h->free = 1;
-
-    // hitta föregående block för ev. merge bakåt
-    block_header_t* prev = NULL;
-    block_header_t* curr = first_block;
-    while (curr && curr != h) {
-        prev = curr;
-        curr = curr->next;
+    segment_t* prev = NULL;
+    segment_t* cur  = seg_head;
+    while (cur) {
+        if (!cur->free && cur->start == off) {
+            cur->free = 1;
+            break;
+        }
+        prev = cur;
+        cur  = cur->next;
     }
 
-    // merge bakåt
-    if (prev && prev->free) {
-        coalesce_with_next(prev);
-        h = prev;
+    if (!cur) {
+        pthread_mutex_unlock(&mem_lock);
+        return;
     }
 
-    // merge framåt
-    coalesce_with_next(h);
+    // Merge med nästa om fri och direkt efter
+    if (cur->next && cur->next->free &&
+        cur->start + cur->size == cur->next->start) {
+        segment_t* victim = cur->next;
+        cur->size += victim->size;
+        cur->next = victim->next;
+        free(victim);
+    }
+
+    // Merge med föregående om fri och direkt före
+    if (prev && prev->free &&
+        prev->start + prev->size == cur->start) {
+        prev->size += cur->size;
+        prev->next = cur->next;
+        free(cur);
+    }
 
     pthread_mutex_unlock(&mem_lock);
 }
 
-// ändra storlek på blocket
 void* mem_resize(void* block, size_t size) {
     if (block == NULL) {
         return mem_alloc(size);
     }
-
     if (size == 0) {
         mem_free(block);
         return zero_ptr;
     }
-
-    size_t req = align_up(size);
+    if (!memory_pool) return NULL;
 
     pthread_mutex_lock(&mem_lock);
 
-    block_header_t* h = header_from_ptr(block);
-    if (!h) {
+    uint8_t* base = (uint8_t*)memory_pool;
+    size_t off = (size_t)((uint8_t*)block - base);
+    segment_t* cur = seg_head;
+    segment_t* prev = NULL;
+    while (cur) {
+        if (!cur->free && cur->start == off) break;
+        prev = cur;
+        cur  = cur->next;
+    }
+
+    if (!cur) {
         pthread_mutex_unlock(&mem_lock);
         return NULL;
     }
 
-    // om blocket redan är tillräckligt stort
-    if (h->size >= req) {
-        size_t remaining = h->size - req;
-        if (remaining >= sizeof(block_header_t) + ALIGN) {
-            uint8_t* base = (uint8_t*)h;
-            block_header_t* new_block =
-                (block_header_t*)(base + sizeof(block_header_t) + req);
-            new_block->size = remaining - sizeof(block_header_t);
-            new_block->free = 1;
-            new_block->next = h->next;
+    size_t old_size = cur->size;
 
-            h->size = req;
-            h->next = new_block;
+    // Om nya storleken är mindre: shrink in-place
+    if (size <= old_size) {
+        size_t shrink = old_size - size;
+        if (shrink > 0) {
+            cur->size = size;
+            segment_t* new_free = (segment_t*)malloc(sizeof(segment_t));
+            if (!new_free) {
+                // Kunde inte splitta, behåll gammal storlek
+                cur->size = old_size;
+            } else {
+                new_free->start = cur->start + size;
+                new_free->size  = shrink;
+                new_free->free  = 1;
+                new_free->next  = cur->next;
+                cur->next       = new_free;
+            }
         }
         pthread_mutex_unlock(&mem_lock);
         return block;
     }
 
-    // försök växa in i nästa block om det är fritt och ligger direkt efter
-    block_header_t* next = h->next;
-    if (next && next->free) {
-        uint8_t* h_end = (uint8_t*)h + sizeof(block_header_t) + h->size;
-        if ((uint8_t*)next == h_end) {
-            size_t total = h->size + sizeof(block_header_t) + next->size;
-            if (total >= req) {
-                // ta över next
-                h->next = next->next;
-                h->size = total;
+    // Försök växa in i nästa segment om det är fritt + direkt angränsande
+    if (cur->next && cur->next->free &&
+        cur->start + cur->size == cur->next->start &&
+        cur->size + cur->next->size >= size) {
 
-                // dela av eventuell rest
-                size_t remaining = h->size - req;
-                if (remaining >= sizeof(block_header_t) + ALIGN) {
-                    uint8_t* base = (uint8_t*)h;
-                    block_header_t* new_block =
-                        (block_header_t*)(base + sizeof(block_header_t) + req);
-                    new_block->size = remaining - sizeof(block_header_t);
-                    new_block->free = 1;
-                    new_block->next = h->next;
+        size_t needed_extra = size - cur->size;
 
-                    h->size = req;
-                    h->next = new_block;
-                }
-
-                pthread_mutex_unlock(&mem_lock);
-                return block;
-            }
+        if (needed_extra >= cur->next->size) {
+            segment_t* victim = cur->next;
+            cur->size += victim->size;
+            cur->next = victim->next;
+            free(victim);
+        } else {
+            cur->size += needed_extra;
+            cur->next->start += needed_extra;
+            cur->next->size  -= needed_extra;
         }
+        pthread_mutex_unlock(&mem_lock);
+        return block;
     }
 
-    // annars: allokera nytt block och kopiera
+    // Annars: lås upp och gör "alloc+copy+free" som fallback
     pthread_mutex_unlock(&mem_lock);
 
     void* new_block = mem_alloc(size);
-    if (!new_block) {
-        return NULL;
-    }
+    if (!new_block) return NULL;
 
-    // kopiera min(old_size, new_size)
-    block_header_t* old_h = header_from_ptr(block);
-    size_t copy_size = old_h ? (old_h->size < size ? old_h->size : size) : 0;
-    if (copy_size > 0) {
-        memcpy(new_block, block, copy_size);
-    }
-
+    size_t copy_size = old_size < size ? old_size : size;
+    memcpy(new_block, block, copy_size);
     mem_free(block);
     return new_block;
 }
 
-void mem_deinit() {
+void mem_deinit(void) {
     pthread_mutex_lock(&mem_lock);
     if (memory_pool) {
 #ifdef __linux__
@@ -312,7 +318,7 @@ void mem_deinit() {
 #endif
         memory_pool = NULL;
         pool_size   = 0;
-        first_block = NULL;
     }
+    free_segments();
     pthread_mutex_unlock(&mem_lock);
 }
