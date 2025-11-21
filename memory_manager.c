@@ -6,19 +6,13 @@
 #include <pthread.h>
 
 /*
- * On Linux (CodeGrade) we use mmap so the tests can see
- * an allocation of exactly the requested size (e.g. 6000).
- * On Windows / non-Unix we fall back to malloc.
+ * Simple segment-based memory manager.
+ * - One big pool allocated with malloc(size) in mem_init.
+ * - Blocks are described in a static metadata array outside the pool.
+ * - First-fit allocation with splitting.
+ * - Free coalesces neighbour free blocks.
+ * - Thread-safe via a global mutex.
  */
-#if defined(__unix__) || defined(__APPLE__)
-    #include <sys/mman.h>
-    #include <unistd.h>
-    #define USE_MMAP 1
-#else
-    #define USE_MMAP 0
-#endif
-
-/* --------- Internal data structures (metadata outside the pool) --------- */
 
 typedef struct Block {
     size_t offset;   // offset into memory_pool
@@ -26,7 +20,7 @@ typedef struct Block {
     int    free;     // 1 = free, 0 = allocated
 } Block;
 
-#define MAX_BLOCKS 1024  // plenty for our tests
+#define MAX_BLOCKS 1024  // enough for our tests
 
 static void   *memory_pool  = NULL;
 static size_t  pool_size    = 0;
@@ -43,6 +37,13 @@ static void internal_reset_state(void) {
     block_count = 0;
 }
 
+static size_t align8(size_t size) {
+    if (size == 0) return 0;
+    size_t rem = size & 7;
+    if (rem == 0) return size;
+    return size + (8 - rem);
+}
+
 /* Merge block i with its next neighbour (i+1). Caller must ensure both are free
  * and contiguous. */
 static void merge_with_next(size_t i) {
@@ -56,14 +57,14 @@ static void merge_with_next(size_t i) {
 
     b->size += n->size;
 
-    // shift the remaining blocks left
+    // shift remaining blocks left
     for (size_t j = i + 1; j + 1 < block_count; ++j) {
         blocks[j] = blocks[j + 1];
     }
     block_count--;
 }
 
-/* Find block index by pointer offset; returns -1 if not found. */
+/* Find block index by pointer; returns -1 if not found. */
 static int find_block_index_by_ptr(void *ptr) {
     if (!memory_pool || !ptr) return -1;
 
@@ -76,54 +77,28 @@ static int find_block_index_by_ptr(void *ptr) {
     return -1;
 }
 
-/* Align size to 8 bytes to keep addresses nice. */
-static size_t align8(size_t size) {
-    if (size == 0) return 0;
-    size_t rem = size & 7;
-    if (rem == 0) return size;
-    return size + (8 - rem);
-}
-
-/* --------- Public API implementation --------- */
+/* --------- Public API --------- */
 
 void mem_init(size_t size) {
     pthread_mutex_lock(&mem_lock);
 
-    /* Allow re-initialisation: free previous pool if any */
+    // If already initialised: free old pool
     if (memory_pool) {
-#if USE_MMAP
-        munmap(memory_pool, pool_size);
-#else
         free(memory_pool);
-#endif
         internal_reset_state();
     }
 
     if (size == 0) {
-        // Degenerate pool, but keep it defined
-        internal_reset_state();
+        // degenerate pool – nothing to allocate
         pthread_mutex_unlock(&mem_lock);
         return;
     }
 
-#if USE_MMAP
-    void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (ptr == MAP_FAILED) {
-        ptr = NULL;
-    }
-#else
-    void *ptr = NULL;
-#endif
-
+    void *ptr = malloc(size);
     if (!ptr) {
-        // Fallback to malloc if mmap failed or we're on Windows
-        ptr = malloc(size);
-        if (!ptr) {
-            pthread_mutex_unlock(&mem_lock);
-            fprintf(stderr, "mem_init: failed to allocate %zu bytes\n", size);
-            exit(EXIT_FAILURE);
-        }
+        pthread_mutex_unlock(&mem_lock);
+        fprintf(stderr, "mem_init: failed to allocate %zu bytes\n", size);
+        exit(EXIT_FAILURE);
     }
 
     memory_pool = ptr;
@@ -146,21 +121,21 @@ void *mem_alloc(size_t size) {
         return NULL;
     }
 
-    // In the tests, mem_alloc(0) is expected to return a non-NULL pointer
-    // if there is free space, so we treat 0 as 1 byte.
+    // Tests förväntar att mem_alloc(0) returnerar icke-NULL
+    // om det finns ledigt minne, så vi behandlar 0 som 1 byte.
     if (size == 0) {
         size = 1;
     }
 
     size = align8(size);
 
-    // First-fit search
+    // First-fit
     for (size_t i = 0; i < block_count; ++i) {
         Block *b = &blocks[i];
         if (!b->free) continue;
         if (b->size < size) continue;
 
-        size_t remaining = b->size - size;
+        size_t remaining    = b->size - size;
         size_t alloc_offset = b->offset;
 
         b->free = 0;
@@ -168,15 +143,14 @@ void *mem_alloc(size_t size) {
 
         if (remaining > 0) {
             if (block_count >= MAX_BLOCKS) {
-                // no room for new metadata block
-                // undo and fail
+                // no room for metadata -> fail and undo
                 b->free = 1;
                 b->size += remaining;
                 pthread_mutex_unlock(&mem_lock);
                 return NULL;
             }
 
-            // Insert new free block right after this one
+            // insert new free block after this one
             for (size_t j = block_count; j > i + 1; --j) {
                 blocks[j] = blocks[j - 1];
             }
@@ -193,7 +167,7 @@ void *mem_alloc(size_t size) {
     }
 
     pthread_mutex_unlock(&mem_lock);
-    return NULL; // no suitable block
+    return NULL;
 }
 
 void mem_free(void *ptr) {
@@ -208,21 +182,21 @@ void mem_free(void *ptr) {
 
     int idx = find_block_index_by_ptr(ptr);
     if (idx < 0) {
-        // pointer not managed by us -> ignore
+        // pointer not from our pool – ignore
         pthread_mutex_unlock(&mem_lock);
         return;
     }
 
     Block *b = &blocks[idx];
     if (b->free) {
-        // double free: ignore (tests expect robustness)
+        // double free – ignore (robustness)
         pthread_mutex_unlock(&mem_lock);
         return;
     }
 
     b->free = 1;
 
-    // Coalesce with previous
+    // coalesce with previous
     if (idx > 0) {
         Block *prev = &blocks[idx - 1];
         if (prev->free &&
@@ -233,7 +207,7 @@ void mem_free(void *ptr) {
         }
     }
 
-    // Coalesce with next
+    // coalesce with next
     if (idx + 1 < (int)block_count) {
         Block *next = &blocks[idx + 1];
         if (next->free &&
@@ -253,14 +227,13 @@ void *mem_resize(void *ptr, size_t size) {
         return NULL;
     }
 
-    // Behaviour similar to realloc
+    // realloc-liknande beteende:
     if (ptr == NULL) {
         pthread_mutex_unlock(&mem_lock);
         return mem_alloc(size);
     }
 
     if (size == 0) {
-        // free and return NULL
         pthread_mutex_unlock(&mem_lock);
         mem_free(ptr);
         return NULL;
@@ -270,7 +243,7 @@ void *mem_resize(void *ptr, size_t size) {
 
     int idx = find_block_index_by_ptr(ptr);
     if (idx < 0) {
-        // unknown pointer -> behave like malloc
+        // okänd pointer -> bete dig som malloc
         pthread_mutex_unlock(&mem_lock);
         return mem_alloc(size);
     }
@@ -279,26 +252,22 @@ void *mem_resize(void *ptr, size_t size) {
     size_t old_size = b->size;
 
     if (size <= old_size) {
-        // shrink in place; optionally split
+        // shrink in place, ev. split
         size_t remaining = old_size - size;
         b->size = size;
 
-        if (remaining > 0) {
-            if (block_count < MAX_BLOCKS) {
-                // insert a free block right after b
-                for (size_t j = block_count; j > idx + 1; --j) {
-                    blocks[j] = blocks[j - 1];
-                }
-                blocks[idx + 1].offset = b->offset + size;
-                blocks[idx + 1].size   = remaining;
-                blocks[idx + 1].free   = 1;
-                block_count++;
-
-                // try merging the new free block with its next neighbour
-                merge_with_next(idx + 1);
+        if (remaining > 0 && block_count < MAX_BLOCKS) {
+            // insert a free tail block
+            for (size_t j = block_count; j > idx + 1; --j) {
+                blocks[j] = blocks[j - 1];
             }
-            // if we cannot store metadata, we just "waste" the tail,
-            // which is fine for the tests.
+            blocks[idx + 1].offset = b->offset + size;
+            blocks[idx + 1].size   = remaining;
+            blocks[idx + 1].free   = 1;
+            block_count++;
+
+            // försöker merge:a nya blocket med nästa
+            merge_with_next(idx + 1);
         }
 
         void *result = ptr;
@@ -306,7 +275,7 @@ void *mem_resize(void *ptr, size_t size) {
         return result;
     }
 
-    // Try to expand in place into the next block if it is free
+    // försök expandera in i nästa block om det är fritt
     if (idx + 1 < (int)block_count) {
         Block *next = &blocks[idx + 1];
         if (next->free &&
@@ -319,7 +288,6 @@ void *mem_resize(void *ptr, size_t size) {
                 next->size   -= needed_extra;
                 b->size       = size;
             } else {
-                // consume entire next block
                 b->size += next->size;
                 merge_with_next(idx);
             }
@@ -330,12 +298,11 @@ void *mem_resize(void *ptr, size_t size) {
         }
     }
 
-    // Fallback: allocate new block, copy, free old
+    // fallback: allokera ny, kopiera, free:a gammal
     pthread_mutex_unlock(&mem_lock);
     void *new_ptr = mem_alloc(size);
     if (!new_ptr) {
-        // keep old block valid on failure
-        return NULL;
+        return NULL; // behåll gamla blocket giltigt
     }
 
     size_t copy_size = old_size < size ? old_size : size;
@@ -347,18 +314,10 @@ void *mem_resize(void *ptr, size_t size) {
 void mem_deinit(void) {
     pthread_mutex_lock(&mem_lock);
 
-    if (!memory_pool) {
-        pthread_mutex_unlock(&mem_lock);
-        return;
+    if (memory_pool) {
+        free(memory_pool);
+        internal_reset_state();
     }
-
-#if USE_MMAP
-    munmap(memory_pool, pool_size);
-#else
-    free(memory_pool);
-#endif
-
-    internal_reset_state();
 
     pthread_mutex_unlock(&mem_lock);
 }
